@@ -20,6 +20,12 @@ from sklearn.cross_validation import train_test_split
 from scipy import stats
 from functools import partial
 from sklearn.metrics import confusion_matrix
+from sklearn.metrics import log_loss
+from sklearn.linear_model import RANSACRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.ensemble import RandomForestClassifier
 
 
 def calcCRPS(prob, expected):
@@ -29,31 +35,30 @@ def calcCRPS(prob, expected):
     return C
 
 
-def corr_matrix(data):
-    corr = data.corr()
-    with open("data/corr_matrix.pkl", "w") as f:
-        cPickle.dump(corr, f)
-    plt.figure(figsize=(40, 40))
-    fig = sm.graphics.plot_corr(corr.as_matrix(), xnames=list(corr.columns.values), ynames=list(corr.columns.values))
-    fig.savefig("data/corr_matrix", format="png")
-
-
-def getProb(estimator, X, bias=2.45, outlier_value=6):
+def getProb(estimator, X, bias=2.45, outlier_value=25):
     pred = estimator.predict(X)
-    outliers = (pred > outlier_value) & (estimator.outliers(X).astype(bool))
-    print outliers.sum()
+    cl = estimator.outliers(X)
+    zero = (pred < 0.1) & (cl == 0)
+    outliers = (pred > 10) & (cl == 2)
+    # outliers_val = (pred > outlier_value) & outliers
+    # avg = pred[outliers].mean()
+    # avg_outliers = (pred > avg) & outliers
+    # med = np.median(pred[outliers])
+    # med_outliers = (pred > med) & outliers
+    # print "25", round(outliers_val.sum()/float(outliers.size), 5), "avg", avg, round(avg_outliers.sum()/float(outliers.size), 5), "median", med, round(med_outliers.sum()/float(outliers.size), 5)
+    # outliers = avg_outliers
     pred = pred.reshape((X.shape[0], 1))
-    # create probability distribution for each prediction: prob = 0 if x < prediction, prob = 1 otherwise
-    # 2 matrices shape (data size, 70)
+
     prob = stats.logistic.cdf(x=np.tile(np.arange(70), (pred.size, 1)), loc=(np.tile(pred, (1, 70)) - bias))
+    # if zero.any():
+    #     prob[zero, :] = np.tile(np.repeat(1, 70), (zero.sum(), 1))
     # if outliers.any():
-    #     # print outliers.sum(), prob[outliers, :].shape, np.tile(np.repeat(0, 70), (outliers.sum(), 1)).shape
     #     # prob[outliers, :] = stats.logistic.cdf(x=np.tile(np.arange(70), (outliers.sum(), 1)), loc=(np.tile(outlier_value, (1, 70)) - bias))
     #     prob[outliers, :] = np.tile(np.repeat(0, 70), (outliers.sum(), 1))
     return prob
 
 
-def scorer(estimator, X, y, bias=2.45, outlier_value=6):
+def scorer(estimator, X, y, bias=2.45, outlier_value=25):
     actual = y
     prob = getProb(estimator, X, bias, outlier_value)
     crps = calcCRPS(prob, actual.reshape((actual.size, 1)))
@@ -67,42 +72,163 @@ def scorer_class(estimator, X, y):
     return matr[1, 1]/(matr[0, 1] + matr[1, 0] + matr[1, 1])
 
 
-def intersections(low_null_rate, data, intersect_cols={"time", "nRadars", "DistanceToRadar"}):
-    for i1 in range(low_null_rate.size):
-        # data[low_null_rate[i1] + "_log"] = np.log(1 + data[low_null_rate[i1]]).astype(np.float32)
-        # data[low_null_rate[i1] + "_sqrt"] = np.sqrt(data[low_null_rate[i1]]).astype(np.float32)
-        # data[low_null_rate[i1] + "_exp"] = np.exp(data[low_null_rate[i1]]).astype(np.float32)
-        # data[low_null_rate[i1] + "_q"] = (data[low_null_rate[i1]] * data[low_null_rate[i1]]).astype(np.float32)
-        for i2 in range(i1, low_null_rate.size):
-            spl1 = low_null_rate[i1].split("_")
-            spl2 = low_null_rate[i2].split("_")
-            if spl1[0] != spl2[0] and spl1[0] in intersect_cols and (spl1[1] == spl2[1] if len(spl1)+len(spl2) == 4 else True):
-                data[low_null_rate[i1] + "_" + low_null_rate[i2]] = data[low_null_rate[i1]] * data[low_null_rate[i2]]
+def classification_scorer(estimator, X, y):
+    pred = estimator.predict_proba(X)
+    return -log_loss(y, pred)
+
+
+class DataTransformer(object):
+    def __init__(self, calc_corr=False, corr_file="data/corr_matrix.pkl", corr_threshold=0.98, na_rate_threshold=0.1, na_replace=np.mean,
+                 minus_inf_replace=np.finfo(np.float32).min, inf_replace=np.finfo(np.float32).max, scaler=StandardScaler, null_rate=0.9):
+
+        self.corr_file = corr_file
+        self.corr_threshold = corr_threshold
+        self.na_replace = na_replace
+        self.minus_inf_replace = minus_inf_replace
+        self.inf_replace = inf_replace
+        self.cols_del = None
+        self.low_null_rate = None
+        self.scaler = scaler()
+        self.na_rate_threshold = na_rate_threshold
+        self.calc_corr = calc_corr
+        self.null_rate = null_rate
+        self.high_null_rate = None
+
+    def fit_transform(self, file_in):
+        data = pd.read_csv(file_in)
+        Id = data["Id"].copy()
+        data.drop("Id", axis=1, inplace=True)
+
+        # if self.calc_corr:
+        #     corr_matrix(data, corr_file=self.corr_file)
+
+        target = data["Expected"].copy()
+        data.drop("Expected", axis=1, inplace=True)
+
+        with open(self.corr_file) as f:
+            corr = cPickle.load(f)
+
+        corr_cols_drop = corr.columns[~np.in1d(corr.columns.values, data.columns.values)]
+        corr.drop(corr_cols_drop, axis=0, inplace=True)
+        corr.drop(corr_cols_drop, axis=1, inplace=True)
+
+        indices = np.where((corr > self.corr_threshold) | (corr < -self.corr_threshold))
+        indices = [(corr.index[x], corr.columns[y]) for x, y in zip(*indices) if x != y and x < y]
+        null = pd.isnull(data).sum()/data.shape[0]
+        self.cols_del = np.unique([x if null[x] > null[y] else y for x, y in indices])
+
+        data.drop(self.cols_del, axis=1, inplace=True)
+        print "dropped highly correlated features, new data shape {}".format(data.shape)
+
+        # generate intersections
+        cols = [x for x in list(data.columns.values) if x not in set(preprocess.PRECIP) and not re.findall("_closest", x)]
+        null = pd.isnull(data[cols]).sum()/data.shape[0]
+        self.low_null_rate = null.index[null < self.na_rate_threshold].values
+        self.high_null_rate = null.index[null > self.null_rate].values
+        data.drop(self.high_null_rate, axis=1, inplace=True)
+        print "dropped features with null rate greater {0}, new data shape {1}".format(self.null_rate, data.shape)
+
+        columns = data.columns
+
+        # data = pd.DataFrame(self.scaler.fit_transform(data), columns=columns)
+        self._intersections(self.low_null_rate, data)
+
+        print data.shape
+        data = data.fillna(np.min(data) - (np.max(data)-np.min(data))/float(data.shape[0]))
+
+        data.replace([-pd.np.inf], self.minus_inf_replace, inplace=True)
+        data.replace([pd.np.inf], self.inf_replace, inplace=True)
+
+        data["high_precip"] = data[["graupel", "heavy_rain", "dry_snow", "rain/hail", "moderate_rain"]].values.any(axis=1).astype(np.float32)
+        print data["high_precip"].unique()
+        return Id, data, target
+
+    def transform(self, file_in):
+        data = pd.read_csv(file_in)
+        Id = data["Id"].copy()
+        data.drop("Id", axis=1, inplace=True)
+        data.drop(self.cols_del, axis=1, inplace=True)
+        data.drop(self.high_null_rate, axis=1, inplace=True)
+        columns = data.columns
+        # data = data.fillna(self.na_replace(data))
+        # data = pd.DataFrame(self.scaler.transform(data), columns=columns)
+        self._intersections(self.low_null_rate, data)
+        data = data.fillna(np.min(data) - (np.max(data)-np.min(data))/float(data.shape[0]))
+
+        data.replace([-pd.np.inf], self.minus_inf_replace, inplace=True)
+        data.replace([pd.np.inf], self.inf_replace, inplace=True)
+
+        data["high_precip"] = data[["graupel", "heavy_rain", "dry_snow", "rain/hail", "moderate_rain"]].values.any(axis=1).astype(np.float32)
+        print "generated from {0} data frame shape {1}".format(file_in, data.shape)
+
+        return Id, data
+
+    @staticmethod
+    def _intersections(low_null_rate, data, intersect_cols={"time", "nRadars", "DistanceToRadar"}):
+        for i1 in range(low_null_rate.size):
+            # data[low_null_rate[i1] + "_log"] = np.log(1 + data[low_null_rate[i1]]).astype(np.float32)
+            # data[low_null_rate[i1] + "_sqrt"] = np.sqrt(data[low_null_rate[i1]]).astype(np.float32)
+            # data[low_null_rate[i1] + "_exp"] = np.exp(data[low_null_rate[i1]]).astype(np.float32)
+            # data[low_null_rate[i1] + "_q"] = (data[low_null_rate[i1]] * data[low_null_rate[i1]] * data[low_null_rate[i1]]).astype(np.float32)
+            for i2 in range(i1, low_null_rate.size):
+                spl1 = low_null_rate[i1].split("_")  # if low_null_rate[i1] not in preprocess.PRECIP else [low_null_rate[i1]]
+                spl2 = low_null_rate[i2].split("_")  # if low_null_rate[i2] not in preprocess.PRECIP else [low_null_rate[i2]]
+
+                if spl1[0] != spl2[0] and spl1[0] in intersect_cols and (spl1[1] == spl2[1] if len(spl1)+len(spl2) == 4 else True): #
+                    data[low_null_rate[i1] + "_" + low_null_rate[i2]] = data[low_null_rate[i1]] * data[low_null_rate[i2]]
 
 
 class regressor(GradientBoostingRegressor):
     def fit(self, X, y, monitor=None):
-        # outliers = np.where(y > 70.)[0]
-        # y = np.delete(y, outliers)
-        # X = np.delete(X, outliers, axis=0)
-        cl = GradientBoostingClassifier(learning_rate=0.1, n_estimators=25, max_depth=6, subsample=0.9)
-        # train, test, y_train, y_test = train_test_split(X, y, test_size=0.5, random_state=10)
+        # na_rows = np.isnan(X).any(axis=1)
+        # X = X[~na_rows]
+        # y = y[~na_rows]
 
-        y_outliers = y > 69
-        cl.fit(X, y_outliers)
-        # print scorer_class(cl, train, y_outliers), scorer_class(cl, test, y_test > 69)
+        threshold = 69.0
+        outliers = y > threshold
+        not_zero = (y > 0) & (y <= threshold)
+        y_class = y.copy()
+        y_class[outliers] = 2
+        y_class[not_zero] = 1
+        outliersNum = outliers.sum()
+        nonZeroNum = not_zero.sum()
+        zeroNum = y_class.size - outliersNum - nonZeroNum
+        cl = RandomForestClassifier(max_depth=6, min_samples_leaf=20, n_estimators=10)
+        sample_weight = np.ones(y_class.shape, dtype=int)
+        weight1 = 1  # max(round(0.2 * zeroNum / nonZeroNum), 1)
+        weight2 = max(round(0.05 * zeroNum / outliersNum), 1)
+        sample_weight[not_zero] = weight1
+        sample_weight[outliers] = weight2
+        # train, test, y_train, y_test = train_test_split(X, y, test_size=0.5, random_state=10)
+        # y_outliers = y > 69
+        cl.fit(X, y_class)
+        print classification_scorer(cl, X, y_class)
         # test = np.append(test, cl.predict(test).reshape((test.shape[0], 1)), 1)
         # X = np.append(X, cl.predict(X).reshape((X.shape[0], 1)), 1)
-        y[y > 70.] = 70.
-        # y[y > 71] = 71 + np.log(y[y > 71] - (71 - 1))
+        y[y > 70.] = 75.
+        # y = np.log(1 + y)
+
         self.classifier = cl
+
         return super(regressor, self).fit(X, y, monitor)
 
     def predict(self, X):
-        # X = np.append(X, self.classifier.predict(X).reshape((X.shape[0], 1)), 1)
-        return super(regressor, self).predict(X)
+        # X = X.copy()
+        # m = np.nanmedian(X, axis=0)
+        # # print m.shape
+        # for i in np.arange(X.shape[1]):
+        #     na = np.isnan(X[:, i])
+        #     X[na, i] = m[i]
+        pred = super(regressor, self).predict(X)
+        # pred = np.exp(pred) - 1
+        return pred  # super(regressor, self).predict(X)
 
     def outliers(self, X):
+        # X = X.copy()
+        # m = np.nanmedian(X, axis=0)
+        # for i in np.arange(X.shape[1]):
+        #     na = np.isnan(X[:, i])
+        #     X[na, i] = m[i]
         return self.classifier.predict(X)
 
 
@@ -112,162 +238,73 @@ class AdaBoostRegr(AdaBoostRegressor):
         # y[y > 71] = 71 + np.log(y[y > 71] - (71 - 1))
         return super(AdaBoostRegr, self).fit(X, y, monitor)
 
-data = pd.read_csv("data/train_preprocessed.csv")
-Id = data["Id"].copy()
-data.drop("Id", axis=1, inplace=True)
 
-target = data["Expected"].copy()
-print np.percentile(target, 99.65)
-data.drop("Expected", axis=1, inplace=True)
+class init_cl:
+    def __init__(self, est):
+        self.est = est
 
-# target = np.log(1 + target)
-# print target.describe()
-# outliers = target.index.values[target.values > 70]
-# target.drop(outliers, inplace=True)
-# data.drop(outliers, inplace=True)
-# print outliers.size, target.size, data.shape
+    def predict(self, X):
+        return self.est.predict(X)[:, np.newaxis]
 
-# unique = data.apply(lambda x: x[~pd.isnull(x)].unique().size)
-# data.replace([-pd.np.inf], np.finfo(np.float32).min, inplace=True)
-# data.replace([pd.np.inf], np.finfo(np.float32).max, inplace=True)
-
-# null stat
-# cols = [x for x in list(data.columns.values) if x not in set(preprocess.PRECIP) and not re.findall("_closest", x)]
-# null = pd.isnull(data[cols]).sum()/data.shape[0]
-#
-# data = data.fillna(data.mean())
-
-with open("data/corr_matrix.pkl") as f:
-    corr = cPickle.load(f)
-
-# print "******Primary model******"
-# start = time.time()
-
-# importance_primary = pd.Series(classifier.feature_importances_, index=data.columns)
-# min_importance = 0.0015
-# cols_keep = importance_primary.index.values[importance_primary.values > min_importance]
-# print "keep:", cols_keep.size, "total importance: ", importance_primary[importance_primary.values > min_importance].sum(), "from:", importance_primary.sum()
-# print "time", round((time.time() - start)/60, 1)
-# print cols_keep
-# print scorer(classifier, data, target)
-
-corr_cols_drop = corr.columns[~np.in1d(corr.columns.values, data.columns.values)]
-corr.drop(corr_cols_drop, axis=0, inplace=True)
-corr.drop(corr_cols_drop, axis=1, inplace=True)
-threshold = 0.95
-indices = np.where((corr > threshold) | (corr < -threshold))
-indices = [(corr.index[x], corr.columns[y]) for x, y in zip(*indices) if x != y and x < y]
-null = pd.isnull(data).sum()/data.shape[0]
-cols_del = np.unique([x if null[x] > null[y] else y for x, y in indices])
-print threshold, cols_del.size
-
-data.drop(cols_del, axis=1, inplace=True)
-print "dropped correlated features", data.shape
-
-# data = data[cols_keep]
-precip_cols = [x for x in list(data.columns.values) if (x in set(preprocess.PRECIP) or re.findall("_closest", x)) and x != "no_echo"]
-# data.drop(precip_cols, axis=1, inplace=True)
-# print "dropped precip cols", data.shape
-
-# generate intersections
-cols = [x for x in list(data.columns.values) if x not in set(preprocess.PRECIP) and not re.findall("_closest", x)]
-null = pd.isnull(data[cols]).sum()/data.shape[0]
-low_null_rate = null.index[null < 0.1].values
-print low_null_rate.size
-print low_null_rate
-# low_null_rate = null[cols].index[null[cols] < 0.1].values
-# print low_null_rate.size
-
-intersections(low_null_rate, data)
-
-print data.shape
-data.replace([pd.np.nan, -pd.np.inf], np.finfo(np.float32).min, inplace=True)
-data.replace([pd.np.inf], np.finfo(np.float32).max, inplace=True)
-# data = data.fillna(data.mean())
-
-print "******Grid search******"
-start = time.time()
-# cl = GradientBoostingClassifier(learning_rate=0.1, n_estimators=10, max_depth=6, subsample=0.9)
-# target_outliers = target > 69
-#
-# gridSearch = GridSearchCV(cl, param_grid={"n_estimators": [15]}, scoring=scorer_class, verbose=True, cv=6, n_jobs=2)
-# gridSearch.fit(data, target_outliers)
-# print "time", round((time.time() - start)/60, 1)
-# print gridSearch.grid_scores_
-# print gridSearch.best_params_, gridSearch.best_score_
-# print scorer_class(gridSearch.best_estimator_, data, target_outliers)
-# print confusion_matrix(target_outliers, gridSearch.best_estimator_.predict(data))
+    def fit(self, X, y):
+        self.est.fit(X, y)
 
 
-# estimator = AdaBoostRegr(base_estimator=DecisionTreeRegressor(max_depth=6, min_samples_leaf=20), learning_rate=0.1, n_estimators=30, loss="exponential")
-estimator = regressor(max_depth=6, min_samples_leaf=20, learning_rate=0.1, n_estimators=30, subsample=0.9)
-gridSearch = GridSearchCV(estimator, param_grid={}, scoring=partial(scorer, bias=2.45), verbose=True, cv=6, n_jobs=2)
-gridSearch.fit(data.values, target.values)
-scores = gridSearch.grid_scores_
+if __name__ == "__main__":
+    data_transformer = DataTransformer()
+    Id, data, target = data_transformer.fit_transform("data/train_preprocessed.csv")
 
-columns = list(data.columns) # + ["outlier"]
-importance = pd.Series(gridSearch.best_estimator_.feature_importances_, index=columns)
-importance.sort(ascending=False)
-print "time", round((time.time() - start)/60, 1)
-print scores
-print gridSearch.best_params_, gridSearch.best_score_
-print scorer(gridSearch.best_estimator_, data, target)
-print importance
-print confusion_matrix(target > 69, gridSearch.best_estimator_.predict(data) > 69)
-cPickle.dump(gridSearch.best_estimator_, open("best_estimator.pkl", "w"))
-importance.to_csv("importance.csv")
+    print "******Grid search******"
+    start = time.time()
+    print target.median(), (target - target.median()).median(), (target - target.median()).mean()
 
-# estimator = classifier_ada(base_estimator=DecisionTreeRegressor(max_depth=6, min_samples_leaf=20), loss="exponential", learning_rate=0.1, n_estimators=30)
-# estimator.fit(data, target)
-# print confusion_matrix(target > 69, estimator.predict(data) > 69)
-# for outlier_value in np.arange(70, 80, 0.5):
-#     print outlier_value, scorer(estimator, data, target, outlier_value=outlier_value)
+    n_estimators = 40
+    estimator = regressor(max_depth=7, min_samples_leaf=20, learning_rate=0.05, n_estimators=n_estimators, subsample=0.8, random_state=0)
+    # estimator = regressor(normalize=True) #RANSACRegressor(random_state=0, min_samples=0.1, residual_threshold=70)
+    gridSearch = GridSearchCV(estimator, param_grid={}, scoring=partial(scorer, bias=2.45), verbose=True, cv=6, n_jobs=2)
+    gridSearch.fit(data.values, target.values)
+    scores = gridSearch.grid_scores_
+    # estimator.fit(data.values, target.values)
+    # cumsum = -np.cumsum(estimator.oob_improvement_)
+    # x = np.arange(n_estimators) + 1
+    # p = plt.plot(x, cumsum, label='OOB loss')
+    # plt.savefig("oob_score.pdf", format="pdf")
+    columns = list(data.columns)  # + ["outlier"]
+    importance = pd.Series(gridSearch.best_estimator_.feature_importances_, index=columns)
+    importance.sort(ascending=False)
+    print "time", round((time.time() - start)/60, 1)
+    print scores
+    print gridSearch.best_params_, gridSearch.best_score_
+    print scorer(gridSearch.best_estimator_, data.values, target.values)
+    print importance
+    print confusion_matrix(target > 69, gridSearch.best_estimator_.predict(data.values) > 69)
+    cPickle.dump(gridSearch.best_estimator_, open("best_estimator.pkl", "w"))
+    importance.to_csv("importance.csv")
 
-# 1.7 -0.00927094966718
-# start = time.time()
-# estimator = classifier(subsample=0.9, max_depth=12, learning_rate=0.1, n_estimators=30, min_samples_leaf=20, alpha=0.5, loss="quantile")
-# estimator.fit(data, target)
-# print round((time.time()-start)/60)
-#
-# estimator = classifier(subsample=0.9, max_depth=6, learning_rate=0.1, n_estimators=30, min_samples_leaf=20)
-# estimator.fit(data, target)
-# for bias in np.arange(2.4, 2.6, 0.01):
-#     print bias, scorer(estimator, data, target, bias)
+    # for _i in np.arange(5):
+    #     print _i, "\n", confusion_matrix(target > _i, np.round(best_estimator.predict(data)) > _i)
 
-#*********** Submission *************
+    #*********** Submission *************
 
-best_estimator = cPickle.load(open("best_estimator.pkl"))
-best_outlier_value = 0
-best_score = -1
-for outlier_value in np.arange(10, 70, 5):
-    score = scorer(best_estimator, data, target, outlier_value=outlier_value)
-    if score > best_score:
-        best_score = score
-        best_outlier_value = outlier_value
-    # print outlier_value, scorer(gridSearch.best_estimator_, data, target, outlier_value=outlier_value)
-print best_outlier_value, best_score
+    best_estimator = cPickle.load(open("best_estimator.pkl"))
+    # best_outlier_value = 0
+    # best_score = -1
+    # for outlier_value in np.arange(2, 3, 0.1):
+    #     score = scorer(best_estimator, data, target, bias=outlier_value)
+    #     if score > best_score:
+    #         best_score = score
+    #         best_outlier_value = outlier_value
+    #     # print outlier_value, scorer(gridSearch.best_estimator_, data, target, outlier_value=outlier_value)
+    # print best_outlier_value, best_score
 
-test_data = pd.read_csv("data/test_preprocessed.csv")
-Id = test_data["Id"].copy()
-test_data.drop("Id", axis=1, inplace=True)
-# test_data = test_data[cols_keep]
-test_data.drop(cols_del, axis=1, inplace=True)
-# test_data.drop(precip_cols, axis=1, inplace=True)
+    Id, test_data = data_transformer.transform("data/test_preprocessed.csv")
 
-intersections(low_null_rate, test_data)
+    prob = getProb(best_estimator, test_data.values) #, outlier_value=best_outlier_value)
 
-print test_data.shape
-test_data.replace([pd.np.nan, -pd.np.inf], np.finfo(np.float32).min, inplace=True)
-test_data.replace([pd.np.inf], np.finfo(np.float32).max, inplace=True)
-# test_data = test_data.fillna(data.mean())
-# test_data.replace(pd.np.nan, -999, inplace=True)
-
-prob = getProb(best_estimator, test_data, outlier_value=best_outlier_value)
-
-submission = pd.DataFrame(prob, columns=["Predicted"+str(i) for i in range(70)])
-submission["Id"] = Id.astype(int)
-submission = submission.reindex(columns=(["Id"]+["Predicted"+str(i) for i in range(70)]))
-submission.to_csv("submission.csv", index=False)
+    submission = pd.DataFrame(prob, columns=["Predicted"+str(i) for i in range(70)])
+    submission["Id"] = Id.astype(int)
+    submission = submission.reindex(columns=(["Id"]+["Predicted"+str(i) for i in range(70)]))
+    submission.to_csv("submission.csv", index=False)
 
 # [mean: -0.00865, std: 0.00016, params: {'n_estimators': 30, 'subsample': 0.9, 'learning_rate': 0.1, 'max_depth': 6}]
 # {'n_estimators': 30, 'subsample': 0.9, 'learning_rate': 0.1, 'max_depth': 6} -0.00864635259266
@@ -287,3 +324,11 @@ submission.to_csv("submission.csv", index=False)
 # [mean: -0.00857, std: 0.00014, params: {'min_samples_leaf': 20}]
 # {'min_samples_leaf': 20} -0.0085716686151
 # -0.00841192988038
+
+#{} -0.00859428712097
+#0.00845132124168
+
+#
+# {} -0.00856565905373
+# 1186
+# 0.00841950355553

@@ -5,11 +5,13 @@ import numpy as np
 import time
 import cPickle
 from joblib import Parallel, delayed
+from charts.correlation_plots import correlation_plot
+
 NAN = np.array([-99900.0, np.nan, -99903.0, -99901.0, 999.0])
 
 
 def calcStat(seq):
-    # u'count', u'mean', u'std', u'min', u'25%', u'50%', u'75%', u'max'
+    # u'mean', u'std', u'min', u'50%', u'max'
     not_null = (~pd.isnull(seq))
     seq_not_null = seq[not_null]
     if seq_not_null.size > 1:
@@ -161,11 +163,22 @@ def preprocess(file_in, file_out, test=False):
 
     print "File", file_in, "preprocessed to", file_out
 
+
+def corr_matrix(file_in, corr_file):
+    data = pd.read_csv(file_in)
+    data.drop("Id", axis=1, inplace=True)
+
+    corr = data.corr()
+    with open(corr_file, "w") as f:
+        cPickle.dump(corr, f)
+    correlation_plot(corr, "plots/correlations.html")
+
 if __name__ == "__main__":
 
     preprocess("data/train_2013.csv", "data/train_preprocessed.csv")
     preprocess("data/test_2014.csv", "data/test_preprocessed.csv", test=True)
 
+    corr_matrix("data/train_preprocessed.csv", "data/corr_matrix.pkl")
     # def foo(x, transform, axis=1):
     #     return x.apply(transform, axis=axis)
     #
