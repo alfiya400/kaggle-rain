@@ -3,7 +3,7 @@ __author__ = 'alfiya'
 from sklearn.tree import _tree
 from sklearn.utils import array2d
 from sklearn.base import BaseEstimator
-from dataStat import *
+from model import *
 
 
 class classifier(BaseEstimator):

@@ -173,22 +173,82 @@ def corr_matrix(file_in, corr_file):
         cPickle.dump(corr, f)
     correlation_plot(corr, "plots/correlations.html")
 
+
+def csv2libFM_row(x, y_name="Expected"):
+
+    data_iter = ((str(i + 1), v) for i, v in enumerate(x.values if y_name is None else x.drop(y_name).values) if v)  # skip NA values
+    y = min(70, float("0." if y_name is None else x[y_name]))
+
+    return "{y} {data}".format(y=str(y),
+                               data=" ".join([":".join(_) for _ in data_iter]))
+
+
+def libfm_foo(x, transform, drop_cols, axis=1, y_name=None):
+    x.drop(drop_cols, axis=1, inplace=True)
+    return x.apply(transform, axis=axis, args=(y_name,))
+
+
+def csv2libFM(filename, y_name=None, drop_cols=None):
+    if drop_cols is None:
+        drop_cols = ["Id"]
+    data_raw = pd.read_csv(filename, na_filter=False, dtype=str, chunksize=10000)
+    # data_raw.drop(drop_cols, axis=1, inplace=True)
+
+    start = time.time()
+    data = Parallel(n_jobs=4, verbose=11)(delayed(libfm_foo)(x, csv2libFM_row, y_name=y_name, drop_cols=drop_cols) for x in data_raw)
+    data = pd.concat(data)
+
+    file_out = ".".join([filename.split(".")[0], "libfm"])
+    data.to_csv(file_out, index=False)
+
+    t = round((time.time() - start) / 60, 3)
+
+    print "File {filename} preprocessed to {file_out}, time {time}".format(filename=filename, file_out=file_out, time=t)
+
+
+def meta_file(filename, drop_cols=None):
+    if drop_cols is None:
+        drop_cols = ["Expected", "Id"]
+    data_raw = pd.read_csv(filename, dtype=float)
+    data_raw.drop(drop_cols, axis=1, inplace=True)
+
+    null_rate = np.round(pd.isnull(data_raw).sum() / float(data_raw.shape[0]), 5)
+    uni = null_rate.unique()
+
+    zero_iter = uni.size - 1
+    zero_map = dict()
+    for _ in null_rate[null_rate == 0].index.values:
+        k = "PRECIP" if _ in PRECIP else _.split("_")[0]
+
+        if k not in zero_map:
+            zero_map[k] = [_]
+        else:
+            zero_map[k].append(_)
+
+    inverted_zero_map = dict()
+    for v in zero_map.itervalues():
+        for v_ in v:
+            inverted_zero_map[v_] = zero_iter
+        zero_iter += 1
+
+    groups = []
+    for _ in data_raw.columns.values:
+        if null_rate[_]:
+            groups.append(str(np.where(uni == null_rate[_])[0][0] - 1) + "\n")
+        else:
+            groups.append(str(inverted_zero_map[_]) + "\n")
+
+    with open("data/libfmdata.meta", "w") as f:
+        f.writelines(groups)
+
+
 if __name__ == "__main__":
 
-    preprocess("data/train_2013.csv", "data/train_preprocessed.csv")
-    preprocess("data/test_2014.csv", "data/test_preprocessed.csv", test=True)
-
-    corr_matrix("data/train_preprocessed.csv", "data/corr_matrix.pkl")
-    # def foo(x, transform, axis=1):
-    #     return x.apply(transform, axis=axis)
+    # preprocess("data/train_2013.csv", "data/train_preprocessed.csv")
+    # preprocess("data/test_2014.csv", "data/test_preprocessed.csv", test=True)
     #
-    # data_raw = pd.read_csv("data/train_2013.csv", na_filter=False, chunksize=5000)
-    # start = time.time()
-    # # foo(data_raw.get_chunk(10), transform, axis=1)
-    # data = Parallel(n_jobs=6, verbose=11)(delayed(foo)(x, transform, axis=1) for i, x in enumerate(data_raw))
-    # print round((time.time() - start)/60, 3)
-    # print len(data)
-    # start = time.time()
-    # data = pd.concat(data)
-    # data.to_csv("data/train_preprocessed.csv", index=False)
-    # print round((time.time() - start)/60, 3)
+    # corr_matrix("data/train_preprocessed.csv", "data/corr_matrix.pkl")
+
+    csv2libFM("data/train_preprocessed.csv", y_name="Expected")
+    csv2libFM("data/test_preprocessed.csv", y_name=None)
+    meta_file("data/train_preprocessed.csv", drop_cols=None)

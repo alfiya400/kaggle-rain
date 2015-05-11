@@ -1,6 +1,6 @@
 __author__ = 'alfiya'
 
-from dataStat import *
+from model import *
 from sklearn.base import BaseEstimator, clone
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble.gradient_boosting import LogOddsEstimator
