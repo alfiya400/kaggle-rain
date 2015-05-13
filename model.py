@@ -23,6 +23,10 @@ from matplotlib.backends.backend_pdf import PdfPages
 import matplotlib.pyplot as plt
 import seaborn as sns
 sns.set()
+randomState = np.random.RandomState(15)
+
+def timePassed(start):
+    return round((time.time() - start) / 60)
 
 
 def calcCRPS(prob, expected):
@@ -32,42 +36,54 @@ def calcCRPS(prob, expected):
     return C
 
 
-def getProb(pred, bias=2.45, outlier_value=25, scale=1):
-
-    # cl = estimator.labels(X)
-    # zero = (pred < 0.1) & (cl == 0)
-    # outliers = (pred > 10) & (cl == 2)
+def getProb(pred, bias=2.45, scale=1):
     pred = pred.reshape((pred.size, 1))
-
     prob = stats.logistic.cdf(x=np.tile(np.arange(70), (pred.size, 1)), loc=(np.tile(pred, (1, 70)) - bias), scale=scale)
-    # if zero.any():
-    #     prob[zero, :] = np.tile(np.repeat(1, 70), (zero.sum(), 1))
-    # if outliers.any():
-    #     # prob[outliers, :] = stats.logistic.cdf(x=np.tile(np.arange(70), (outliers.sum(), 1)), loc=(np.tile(outlier_value, (1, 70)) - bias))
-    #     prob[outliers, :] = np.tile(np.repeat(0, 70), (outliers.sum(), 1))
     return prob
 
 
-def scorer(estimator, X, y, bias=2.45, outlier_value=25, scale=1, classif=False, has_labels=False, best_par=None):
-    actual = y.reshape((y.size, 1))
-    if classif:
-        pred = estimator.predict_proba(X)[:, :-1]
-        prob = np.cumsum(pred, axis=1)
-    else:
-        pred = estimator.predict(X)
-        if has_labels:
-            if best_par is None:
-                best_par = {0: {"bias": 14, "scale": 4.5}, 1: {"bias": 2.2, "scale": 1.5}}
-            labels = estimator.labels(X)
+def getPred(pred, weights):
+    def getPredbyRow(x, weights=None):
+        return np.concatenate([k * w for k, w in zip(x, weights)])
 
+    return np.apply_along_axis(getPredbyRow, axis=1, arr=pred, weights=weights)
+
+
+def scorer(estimator, X, y, bias=2.45, scale=1,
+           classif=False, weights=None,
+           has_labels=False, bias_scale_by_label=None):
+    actual = y.reshape((y.size, 1))
+
+    # if classif is True then estimator returns matrix of probabilities
+    # otherwise - regression task and estimator return a predicted value
+    if classif:  # classification
+        pred = estimator.predict_proba(X)
+        # if has_labels is True then use different weights for each cluster
+        if has_labels:
+            labels = estimator.labels(X)
+            pred_ = np.ones((X.shape[0], 71), dtype=np.float32)
+
+            for l in np.unique(labels):
+                pred_[labels == l] = getPred(pred[l], weights=weights[l]) #["bias"], scale=bias_scale_by_label[l]["scale"])
+        else:
+            pred_ = getPred(pred, weights=weights)
+        # print pred_.shape
+        prob = np.cumsum(pred_[:, :-1], axis=1)
+        # print prob
+    else:  # regression
+        pred = estimator.predict(X)
+        # if has_labels is True then use best bias and scale for each cluster
+        if has_labels:
+            labels = estimator.labels(X)
             prob = np.ones((X.shape[0], 70), dtype=np.float32)
 
             for l in np.unique(labels):
-                prob[labels == l] = getProb(pred[labels == l], bias=best_par[l]["bias"], outlier_value=outlier_value, scale=best_par[l]["scale"])
+                prob[labels == l] = getProb(pred[labels == l], **bias_scale_by_label[l]) #["bias"], scale=bias_scale_by_label[l]["scale"])
         else:
-            prob = getProb(pred, bias=bias, outlier_value=outlier_value, scale=scale)
+            prob = getProb(pred, bias=bias, scale=scale)
+
     crps = calcCRPS(prob, actual)
-    # print crps
+
     return -crps
 
 
@@ -224,23 +240,6 @@ class Clusterer(BaseEstimator):
         else:
             labels = self.clusterer_.predict(X.copy()[:, self.cluster_columns])
         return labels
-    #
-    # def get_params(self, deep=True):
-    #     return dict(clusterer=self.clusterer,
-    #                 n_clusters=self.n_clusters,
-    #                 columns=self.columns,
-    #                 cluster_columns=self.cluster_columns,
-    #                 clusterer_=self.clusterer_,
-    #                 na_replace=self.na_replace)
-    #
-    # def set_params(self, **params):
-    #     self.clusterer = params["clusterer"]
-    #     self.n_clusters = params["n_clusters"]
-    #     self.columns = params["columns"]
-    #     self.cluster_columns = params["cluster_columns"]
-    #     self.clusterer_ = params["clusterer_"]
-    #     self.na_replace = params["na_replace"]
-    #     return self
 
 class Regressor(BaseEstimator):
     def __init__(self, est=None, params=None, class_as_cluster=False, cl=None, classifier_params=None):
@@ -318,45 +317,48 @@ class Regressor(BaseEstimator):
 
 class myPredictor(BaseEstimator):
     def __init__(self, cluster=None, columns=None, dataTransformer=None,
-                 model_params=None, base_predictor="GradientBoostingRegressor"):
+                 model_params=None, base_predictor="GBRT", bins=None, subsample=100000):
         self.cluster = cluster
         self.columns = columns
         self.dataTransformer = dataTransformer
         self.model_params = model_params
         self.base_predictor = base_predictor
+        self.bins = bins
+        self.subsample = subsample
 
     def fit(self, X, y):
         self.model = {}
-        # print self.cluster.get_params()
+        if self.bins is None:
+            self.bins = {0: None, 1: None}
         labels = self.cluster["cluster"].transform(X)
 
         for l in np.unique(labels):
             lX, columns_ = self.dataTransformer[l].transform(X[labels == l])
             ly = y[labels == l]
-            ly[ly > 70.] = 70.
-            # if X.shape[0] > 500000:
-            #     e = globals()[self.base_predictor](max_depth=8, learning_rate=0.05, n_estimators=100, min_samples_leaf=10, random_state=0)
-            # else:
-            #     e = globals()[self.base_predictor](max_depth=4, learning_rate=0.05, n_estimators=100, min_samples_leaf=10, random_state=0)
-
-            # e = GradientBoostingRegressor(max_depth=1, learning_rate=0.05, n_estimators=1, min_samples_leaf=5)
-            # e.fit(lX, ly)
 
             self.model[l] = Pipeline([("featureSelector", FeatureSelector()),
-                                     ("regressor", globals()[self.base_predictor]())
+                                      ("regressor", globals()[self.base_predictor]())
                                       ])
             self.model[l].set_params(**self.model_params[l])
-            # self.model[l].steps[0][-1].set_params(**{"feature_importance": e.feature_importances_})
-            self.model[l].fit(lX, ly)
+            self.model[l].set_params(**dict(regressor__verbose=1))
+            self.model[l].fit(lX, ly, regressor__subsample=self.subsample, regressor__bins=self.bins[l])
+
         return self
 
     def predict(self, X):
         labels = self.cluster["cluster"].transform(X)
-
         pred = np.zeros(shape=(X.shape[0],), dtype=float)
         for l in np.unique(labels):
             lX, columns_ = self.dataTransformer[l].transform(X[labels == l])
             pred[labels == l] = self.model[l].predict(lX)
+        return pred
+
+    def predict_proba(self, X):
+        labels = self.cluster["cluster"].transform(X)
+        pred = {}
+        for l in np.unique(labels):
+            lX, columns_ = self.dataTransformer[l].transform(X[labels == l])
+            pred[l] = self.model[l].predict_proba(lX)
         return pred
 
     def labels(self, X):
@@ -364,28 +366,30 @@ class myPredictor(BaseEstimator):
 
 
 class GBRT(GradientBoostingRegressor):
-    def fit(self, X, y, monitor=None, **kwargs):
-        size = min(X.shape[0], 50000)
-        ix = randomState.choice(np.arange(X.shape[0]), size=size, replace=False)
-        tmpX = X[ix, :]
-        tmpY = y[ix]
-        tmpY[tmpY > 70.] = 70.
-
-        # y[y > 70.] = 70.
-        return super(GBRT, self).fit(tmpX, tmpY, monitor=monitor)
+    def fit(self, X, y, monitor=None, subsample=50000, bins=None, **kwargs):
+        if subsample and (X.shape[0] > subsample):
+            size = min(X.shape[0], subsample)
+            ix = randomState.choice(np.arange(X.shape[0]), size=size, replace=False)
+            tmpX = X[ix, :]
+            tmpY = y[ix]
+            return super(GBRT, self).fit(tmpX, tmpY, monitor=monitor)
+        else:
+            return super(GBRT, self).fit(X, y, monitor=monitor)
 
 
 class GBCT(GradientBoostingClassifier):
-    def fit(self, X, y, monitor=None, **kwargs):
-        size = min(X.shape[0], 50000)
-        ix = randomState.choice(np.arange(X.shape[0]), size=size, replace=False)
-        tmpX = X[ix, :]
-        tmpY = y[ix]
-        tmpY[tmpY > 70.] = 70.
-        tmpY = np.ceil(tmpY).astype(np.int8)
-
-        # y[y > 70.] = 70.
-        return super(GBCT, self).fit(tmpX, tmpY, monitor=monitor)
+    def fit(self, X, y, monitor=None, subsample=50000, bins=None, **kwargs):
+        # print X.shape, self.get_params()
+        y = np.ceil(y).astype(np.int8)
+        y = np.vectorize(lambda x: bins[x])(y)
+        if subsample and (X.shape[0] > subsample):
+            # size = min(X.shape[0], subsample)
+            ix = randomState.choice(np.arange(X.shape[0]), size=subsample, replace=False)
+            tmpX = X[ix, :]
+            tmpY = y[ix]
+            return super(GBCT, self).fit(tmpX, tmpY, monitor=monitor)
+        else:
+            return super(GBCT, self).fit(X, y, monitor=monitor)
 
 
 class FeatureSelector(BaseEstimator, TransformerMixin):
@@ -396,7 +400,7 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
         self.important_features = None
         self.important_features_names = None
 
-    def fit(self, X, y=None):
+    def fit(self, X, y=None, subsample=False, bins=None):
         self.important_features = np.where(self.feature_importance > self.importance_threshold)[0]
         self.important_features_names = self.column_names[self.important_features]
         # print "important features {0}".format(self.important_features.size), self.feature_importance[self.important_features].sum(), self.feature_importance.sum()
@@ -409,6 +413,29 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
     @property
     def important_columns_(self):
         return self.important_features_names
+
+
+def findBestBiasAndScale(X, y, estimator, randomState):
+    best_scale, best_bias, best_score = 0., 0., -1.
+    ix = randomState.choice(np.arange(X.shape[0]), size=100000, replace=False)
+    tmpX, tmpY = X[ix, :], y[ix].copy()
+    tmpY[tmpY > 70.] = 70.
+
+    if X.shape[0] < 500000:
+        scale_range = np.arange(1.5, 1.7, 0.1)
+        bias_range = np.arange(2.1, 2.7, 0.1)
+    else:
+        scale_range = np.arange(3, 5, 0.5)
+        bias_range = np.arange(12., 17., 1.)
+
+    for scale in scale_range:
+        for bias in bias_range:
+            score = scorer(estimator, tmpX, tmpY, scale=scale, bias=bias)
+            print scale, bias, score
+            if score > best_score:
+                best_score, best_scale, best_bias = score, scale, bias
+    print best_scale, best_bias, best_score
+    return best_scale, best_bias, best_score
 
 if __name__ == "__main__":
     CLASSIF = False
@@ -436,82 +463,42 @@ if __name__ == "__main__":
 
     print "******Grid search******"
     output = {"clusterer": clust, "columns": columns, "clust": {}}
-    randomState = np.random.RandomState(5)
+    # randomState = np.random.RandomState(15)
     pred = np.zeros(shape=target.shape, dtype=float)
-    # print np.isnan(data).sum()
     for l in np.unique(labels):
         n = (labels == l).sum()
-        # corr_thr = 0.98 if n < 500000 else 0.999
         dataTransformer = DataTransformer(columns=columns, corr_threshold=0.98)
         X, columns_ = dataTransformer.fit_transform(data[labels == l])
-        # print dataTransformer.high_null_rate
         y = target[labels == l]
         y[y > 70.] = 70.
-        # print X.shape
-
-        ix = randomState.choice(np.arange(X.shape[0]), size=100000, replace=False)
-        tmpX, tmpY = X[ix, :], y[ix].copy()
-
-        tmpY[tmpY > 70.] = 70.
+        big_cluster = X.shape[0] > 500000
+        print X.shape
         start = time.time()
-        if X.shape[0] > 500000:
-            e = globals()[BASE_PREDICTOR](max_depth=7, learning_rate=0.05, n_estimators=100, min_samples_leaf=10, random_state=0)
-        else:
-            e = globals()[BASE_PREDICTOR](max_depth=6, learning_rate=0.05, n_estimators=100, min_samples_leaf=10, random_state=0)
-
-        # e = GradientBoostingRegressor(max_depth=1, learning_rate=0.05, n_estimators=1, min_samples_leaf=5)
+        e = globals()[BASE_PREDICTOR](max_depth=6 if big_cluster else 3, learning_rate=0.05, n_estimators=10, min_samples_leaf=20, random_state=0)
+        print e
+        scorer_ = partial(scorer, bias=13. if big_cluster else 2.3, scale=4. if big_cluster else 1.6)
+        param_grid = dict(featureSelector__importance_threshold=[0.001, 0.01, 0.02, 0.03],
+                          regressor__max_depth=[6 if big_cluster else 3])
         e.fit(X, y)
-        # del tmpX, tmpY
-        print "primary score {0}, time {1}".format(scorer(e, X, y), round((time.time() - start) / 60))
+        print "primary score {0}, time {1}".format(scorer_(e, X, y), timePassed(start))
         prediction_model = Pipeline([("featureSelector", FeatureSelector(e.feature_importances_, 0.004, columns_)),
                                     ("regressor", globals()[my_predictor](min_samples_leaf=20, learning_rate=0.05, n_estimators=100, subsample=0.8, random_state=0))
                                      ])
-        if X.shape[0] > 500000:
-            param_grid = dict(featureSelector__importance_threshold=[0.02],
-                              regressor__max_depth=[6])
-        else:
-            param_grid = dict(featureSelector__importance_threshold=[0.0001],
-                              regressor__max_depth=[3]) # , regressor__min_samples_leaf=[10]
-        # param_grid = dict(featureSelector__importance_threshold=[0.0],
-        #                   regressor__max_depth=[6], regressor__n_estimators=[40])
-        gridSearch = GridSearchCV(prediction_model, param_grid=param_grid, scoring=partial(scorer, bias=2.45), verbose=True, cv=6, n_jobs=1)
+        gridSearch = GridSearchCV(prediction_model, param_grid=param_grid, scoring=scorer_, verbose=True, cv=6, n_jobs=2)
         gridSearch.fit(X, y)
 
         # output
-        # print gridSearch.best_estimator_.steps
         importance = pd.Series(gridSearch.best_estimator_.steps[-1][-1].feature_importances_, index=gridSearch.best_estimator_.steps[0][-1].important_columns_)
         importance.sort(ascending=False)
         print "GS scores: {0}".format(gridSearch.grid_scores_)
         print "GS best params: {0}, score {1}".format(gridSearch.best_params_, gridSearch.best_score_)
-        print "features {0}, train score {1}".format(importance.size, scorer(gridSearch.best_estimator_, X, y))
+        print "features {0}, train score {1}".format(importance.size, scorer_(gridSearch.best_estimator_, X, y))
         print importance
         print confusion_matrix(y > 1, gridSearch.best_estimator_.predict(X) > 1)
-        # print output["clust"][l]["model"].get_params()
+
         pred[labels == l] = gridSearch.best_estimator_.predict(X)
 
-        best_scale = 0
-        best_bias = 0
-        best_score = -1
-        if X.shape[0] < 500000:
-            scale_range = np.arange(1.5, 1.6, 0.1)
-            bias_range = np.arange(2.1, 2.4, 0.1)
-            # 1.6 2.3 -0.0227722289033
-        else:
-            scale_range = np.arange(4, 6, 0.25)
-            bias_range = np.arange(14., 17., 0.1)
-            # 2.0 6.4 -0.00606061809482
-
-        for scale in scale_range:
-            for bias in bias_range:
-
-                score = scorer(gridSearch.best_estimator_, tmpX, tmpY, scale=scale, bias=bias)
-                print scale, bias, score
-                if score > best_score:
-                    best_score = score
-                    best_scale = scale
-                    best_bias = bias
-                # print outlier_value, scorer(gridSearch.best_estimator_, data, target, outlier_value=outlier_value)
-        print best_scale, best_bias, best_score
+        best_scale, best_bias, best_score = findBestBiasAndScale(X, y, gridSearch.best_estimator_, randomState)
 
         output["clust"][l] = {"dataTransformer": dataTransformer,
                               "model": gridSearch.best_estimator_,
@@ -521,28 +508,31 @@ if __name__ == "__main__":
                               "best_distr_par": {"scale": best_scale, "bias": best_bias}
                               }
 
-
-    prob = getProb(pred)
+    prob = np.ones((data.shape[0], 70), dtype=np.float32)
+    best_par = {k: v["best_distr_par"] for k, v in output["clust"].iteritems()}
+    for l in np.unique(labels):
+        prob[labels == l] = getProb(pred[labels == l], **best_par[l])
     print "total score: ", calcCRPS(prob, target.reshape((target.size, 1)))
-    cPickle.dump(output, open("best_estimator.pkl", "w"))
+    cPickle.dump(output, open("best_model.pkl", "w"))
 
-    del X, y, prob, pred, scale_range, bias_range, importance, e, prediction_model, output, dataTransformer, columns_, clust, labels
-    #*********** Submission *************
+    del X, y, prob, pred, importance, e, prediction_model, output, dataTransformer, columns_, clust, labels
 
-    best_output = cPickle.load(open("best_estimator.pkl"))
+    # *********** Submission *************
+    best_output = cPickle.load(open("best_model.pkl"))
 
-    # x = {k: v["model"].get_params() for k, v in best_output["clust"].iteritems()}
     # MODEL VALIDATION
     model = myPredictor(cluster={"cluster": best_output["clusterer"]}, columns=best_output["columns"],
                         dataTransformer={k: v["dataTransformer"] for k, v in best_output["clust"].iteritems()},
                         model_params={k: v["model"].get_params() for k, v in best_output["clust"].iteritems()},
-                        base_predictor=BASE_PREDICTOR)
+                        base_predictor=my_predictor)
 
     scorer_ = partial(scorer, has_labels=True, best_par={k: v["best_distr_par"] for k, v in best_output["clust"].iteritems()})
     gridSearch = GridSearchCV(model, param_grid={}, scoring=scorer_, verbose=True, cv=2, n_jobs=1)
     gridSearch.fit(data, target)
     print "GS scores: {0}".format(gridSearch.grid_scores_)
-    print "train score {0}".format(scorer(gridSearch.best_estimator_, data, target))
+    print "train score {0}".format(scorer_(gridSearch.best_estimator_, data, target))
+
+    cPickle.dump(gridSearch.best_estimator_, open("best_regressor.pkl", "w"))
 
     test_data = pd.read_csv("data/test_preprocessed.csv")
 
@@ -564,9 +554,6 @@ if __name__ == "__main__":
     submission["Id"] = Id.astype(int)
     submission = submission.reindex(columns=(["Id"]+["Predicted"+str(i) for i in range(70)]))
     submission.to_csv("submission.csv", index=False)
-# -0.0084923375163
-# [928563 198131]
-# -0.00833959102233
 
-# [mean: -0.00898, std: 0.00016, params: {'n_clusters': 2}, mean: -0.00903, std: 0.00016, params: {'n_clusters': 3}, mean: -0.00905, std: 0.00016, params: {'n_clusters': 4}]
-# {'n_clusters': 2} -0.00898400828663
+# GS scores: [mean: -0.00825, std: 0.00006, params: {}]
+# train score -0.00811924743582
