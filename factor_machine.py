@@ -4,7 +4,7 @@ from model import *
 
 def calcCRPS(predFile, expectedFile):
     expected = pd.read_csv(expectedFile, sep=" ", dtype=str, na_filter=False, header=None, usecols=[0]).values.astype(float)
-    prob = getProb(predFile)
+    prob = get_prob_from_prediction(predFile)
     H = (np.tile(np.arange(70), (expected.size, 1)) >= np.tile(expected, (1, 70))).astype(float)
     N = prob.shape[0]
     C = ((prob - H)**2).sum() / (70 * N)
@@ -37,4 +37,4 @@ def getProb(predFile, bias=2.45, outlier_value=25, scale=1):
 
 if __name__ == "__main__":
 
-    print calcCRPS("data/prediction.txt", "data/validation.libfm")
+    print calc_crps("data/prediction.txt", "data/validation.libfm")

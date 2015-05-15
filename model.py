@@ -18,35 +18,49 @@ from sklearn.cluster import KMeans
 from sklearn.base import BaseEstimator, TransformerMixin
 from pandas.tools.plotting import table
 from sklearn.pipeline import Pipeline
-
+from xgboost import XGBClassifier
+from sklearn.tree import DecisionTreeClassifier
+import datetime
 from matplotlib.backends.backend_pdf import PdfPages
 import matplotlib.pyplot as plt
 import seaborn as sns
 sns.set()
 randomState = np.random.RandomState(15)
 
-def timePassed(start):
+
+def time_passed(start):
     return round((time.time() - start) / 60)
 
 
-def calcCRPS(prob, expected):
+def calc_crps(prob, expected):
     H = (np.tile(np.arange(70), (expected.size, 1)) >= np.tile(expected, (1, 70))).astype(float)
     N = prob.shape[0]
     C = ((prob - H)**2).sum() / (70 * N)
     return C
 
 
-def getProb(pred, bias=2.45, scale=1):
+def get_prob_from_prediction(pred, bias=2.45, scale=1):
     pred = pred.reshape((pred.size, 1))
     prob = stats.logistic.cdf(x=np.tile(np.arange(70), (pred.size, 1)), loc=(np.tile(pred, (1, 70)) - bias), scale=scale)
     return prob
 
 
-def getPred(pred, weights):
-    def getPredbyRow(x, weights=None):
+def get_prob_from_joined_classes(pred, weights):
+    def get_prob_by_row(x, weights=None):
         return np.concatenate([k * w for k, w in zip(x, weights)])
 
-    return np.apply_along_axis(getPredbyRow, axis=1, arr=pred, weights=weights)
+    return np.apply_along_axis(get_prob_by_row, axis=1, arr=pred, weights=weights)
+
+
+def classes_weights(y, y_binned):
+    if np.unique(y).size < 71:
+        raise Exception("not enough values")
+    tmp = pd.DataFrame({"bin": y_binned, "class": y})
+    bin_weights_ = tmp.groupby(["bin","class"])["class"].count().div(tmp.groupby(["bin"])["class"].count(), level=0)
+    bin_weights = []
+    for bin_number in bin_weights_.index.get_level_values(0).unique():
+        bin_weights.append(bin_weights_[bin_number].values)
+    return {"weights": bin_weights}
 
 
 def scorer(estimator, X, y, bias=2.45, scale=1,
@@ -56,21 +70,20 @@ def scorer(estimator, X, y, bias=2.45, scale=1,
 
     # if classif is True then estimator returns matrix of probabilities
     # otherwise - regression task and estimator return a predicted value
-    if classif:  # classification
-        pred = estimator.predict_proba(X)
+    if classif:  # CLASSIFICATION
         # if has_labels is True then use different weights for each cluster
         if has_labels:
             labels = estimator.labels(X)
             pred_ = np.ones((X.shape[0], 71), dtype=np.float32)
 
             for l in np.unique(labels):
-                pred_[labels == l] = getPred(pred[l], weights=weights[l]) #["bias"], scale=bias_scale_by_label[l]["scale"])
+                pred_[labels == l] = estimator.predict_proba(X[labels == l])
         else:
-            pred_ = getPred(pred, weights=weights)
-        # print pred_.shape
+            pred_ = estimator.predict_proba(X)
+
         prob = np.cumsum(pred_[:, :-1], axis=1)
-        # print prob
-    else:  # regression
+
+    else:  # REGRESSION
         pred = estimator.predict(X)
         # if has_labels is True then use best bias and scale for each cluster
         if has_labels:
@@ -78,12 +91,12 @@ def scorer(estimator, X, y, bias=2.45, scale=1,
             prob = np.ones((X.shape[0], 70), dtype=np.float32)
 
             for l in np.unique(labels):
-                prob[labels == l] = getProb(pred[labels == l], **bias_scale_by_label[l]) #["bias"], scale=bias_scale_by_label[l]["scale"])
+                prob[labels == l] = get_prob_from_prediction(pred[labels == l], **bias_scale_by_label[l])
         else:
-            prob = getProb(pred, bias=bias, scale=scale)
+            prob = get_prob_from_prediction(pred, bias=bias, scale=scale)
 
-    crps = calcCRPS(prob, actual)
-
+    crps = calc_crps(prob, actual)
+    print crps
     return -crps
 
 
@@ -96,6 +109,29 @@ def scorer_class(estimator, X, y):
 def classification_scorer(estimator, X, y):
     pred = estimator.predict_proba(X)
     return -log_loss(y, pred)
+
+
+def find_best_bias_and_scale(X, y, estimator, randomState):
+    best_scale, best_bias, best_score = 0., 0., -1.
+    ix = randomState.choice(np.arange(X.shape[0]), size=100000, replace=False)
+    tmpX, tmpY = X[ix, :], y[ix].copy()
+    tmpY[tmpY > 70.] = 70.
+
+    if X.shape[0] < 500000:
+        scale_range = np.arange(1.5, 1.7, 0.1)
+        bias_range = np.arange(2.1, 2.7, 0.1)
+    else:
+        scale_range = np.arange(3, 5, 0.5)
+        bias_range = np.arange(12., 17., 1.)
+
+    for scale in scale_range:
+        for bias in bias_range:
+            score = scorer(estimator, tmpX, tmpY, scale=scale, bias=bias)
+            print scale, bias, score
+            if score > best_score:
+                best_score, best_scale, best_bias = score, scale, bias
+    print best_scale, best_bias, best_score
+    return best_scale, best_bias, best_score
 
 
 class DataTransformer(BaseEstimator, TransformerMixin):
@@ -150,7 +186,7 @@ class DataTransformer(BaseEstimator, TransformerMixin):
 
         # print "added intersections data shape {0}".format(data.shape)
 
-        self.na_replace = np.min(data) - (np.max(data) - np.min(data)) / float(data.shape[0])
+        self.na_replace = self.minus_inf_replace  # np.min(data) - (np.max(data) - np.min(data)) / float(data.shape[0])
         self.new_columns = self.new_columns[~np.in1d(self.new_columns, np.concatenate((self.cols_del, self.high_null_rate)))]
         self.new_columns = np.concatenate((self.new_columns, intersect_columns))
         return self
@@ -241,6 +277,143 @@ class Clusterer(BaseEstimator):
             labels = self.clusterer_.predict(X.copy()[:, self.cluster_columns])
         return labels
 
+
+class FeatureSelector(BaseEstimator, TransformerMixin):
+    def __init__(self, feature_importance=None, importance_threshold=None, column_names=None):
+        self.feature_importance = feature_importance
+        self.importance_threshold = importance_threshold
+        self.column_names = column_names
+        self.important_features = None
+        self.important_features_names = None
+
+    def fit(self, X, y=None, subsample=False, bins=None):
+        self.important_features = np.where(self.feature_importance > self.importance_threshold)[0]
+        self.important_features_names = self.column_names[self.important_features]
+        # print "important features {0}".format(self.important_features.size), self.feature_importance[self.important_features].sum(), self.feature_importance.sum()
+
+        return self
+
+    def transform(self, X):
+        return X[:, self.important_features]
+
+    @property
+    def important_columns_(self):
+        return self.important_features_names
+
+
+class GBRT(GradientBoostingRegressor):
+    def fit(self, X, y, monitor=None, subsample=50000, bins=None, **kwargs):
+        if subsample and (X.shape[0] > subsample):
+            size = min(X.shape[0], subsample)
+            ix = randomState.choice(np.arange(X.shape[0]), size=size, replace=False)
+            tmpX = X[ix, :]
+            tmpY = y[ix]
+            return super(GBRT, self).fit(tmpX, tmpY, monitor=monitor)
+        else:
+            return super(GBRT, self).fit(X, y, monitor=monitor)
+
+
+class GBCT(XGBClassifier):
+    def fit(self, X, y, monitor=None, subsample=50000, bins=None, **kwargs):
+        print X.shape
+        y = np.ceil(y).astype(np.int8)
+        if bins is None:
+            raise Exception("set bins")
+            #self.bins = classes_weights(y)
+        else:
+            self.bins = bins
+
+        y = np.vectorize(lambda x: self.bins["bins"][x])(y)
+        if subsample and (X.shape[0] > subsample):
+            # size = min(X.shape[0], subsample)
+            ix = randomState.choice(np.arange(X.shape[0]), size=subsample, replace=False)
+            tmpX = X[ix, :]
+            tmpY = y[ix]
+            return super(GBCT, self).fit(tmpX, tmpY)
+        else:
+            return super(GBCT, self).fit(X, y)
+
+    def predict_proba(self, X):
+        pred = super(GBCT, self).predict_proba(X)
+        return get_prob_from_joined_classes(pred, weights=self.bins["weights"])
+
+
+class GBCT_(DecisionTreeClassifier):
+    def fit(self, X, y, monitor=None, subsample=50000, bins=None, **kwargs):
+        # print X.shape, self.get_params()
+        y = np.ceil(y).astype(np.int8)
+        if bins is None:
+            raise Exception("set bins")
+            #self.bins = classes_weights(y)
+        else:
+            self.bins = bins
+
+        y = np.vectorize(lambda x: self.bins["bins"][x])(y)
+        if subsample and (X.shape[0] > subsample):
+            # size = min(X.shape[0], subsample)
+            ix = randomState.choice(np.arange(X.shape[0]), size=subsample, replace=False)
+            tmpX = X[ix, :]
+            tmpY = y[ix]
+            return super(GBCT_, self).fit(tmpX, tmpY)
+        else:
+            return super(GBCT_, self).fit(X, y)
+
+    def predict_proba(self, X, **kwargs):
+        pred = super(GBCT_, self).predict_proba(X)
+        return get_prob_from_joined_classes(pred, weights=self.bins["weights"])
+
+
+class MyPredictor(BaseEstimator):
+    def __init__(self, cluster=None, columns=None, dataTransformer=None,
+                 model_params=None, base_predictor="GBRT", bins=None, subsample=100000):
+        self.cluster = cluster
+        self.columns = columns
+        self.dataTransformer = dataTransformer
+        self.model_params = model_params
+        self.base_predictor = base_predictor
+        self.bins = bins
+        self.subsample = subsample
+
+    def fit(self, X, y):
+        self.model = {}
+        if self.bins is None:
+            self.bins = {0: None, 1: None}
+        labels = self.cluster["cluster"].transform(X)
+
+        for l in np.unique(labels):
+            lX, columns_ = self.dataTransformer[l].transform(X[labels == l])
+            ly = y[labels == l]
+
+            self.model[l] = Pipeline([("featureSelector", FeatureSelector()),
+                                      ("regressor", globals()[self.base_predictor]())
+                                      ])
+            self.model[l].set_params(**self.model_params[l])
+            # self.model[l].set_params(**dict(regressor__verbose=1))
+            self.model[l].fit(lX, ly, regressor__subsample=self.subsample, regressor__bins=self.bins[l])
+            print "trained", datetime.datetime.now()
+
+        return self
+
+    def predict(self, X):
+        labels = self.cluster["cluster"].transform(X)
+        pred = np.zeros(shape=(X.shape[0],), dtype=float)
+        for l in np.unique(labels):
+            lX, columns_ = self.dataTransformer[l].transform(X[labels == l])
+            pred[labels == l] = self.model[l].predict(lX)
+        return pred
+
+    def predict_proba(self, X):
+        labels = self.cluster["cluster"].transform(X)
+        pred = np.ones((X.shape[0], 71), dtype=float)
+        for l in np.unique(labels):
+            lX, columns_ = self.dataTransformer[l].transform(X[labels == l])
+            pred[labels == l] = self.model[l].predict_proba(lX)
+        return pred
+
+    def labels(self, X):
+        return self.cluster["cluster"].transform(X)
+
+
 class Regressor(BaseEstimator):
     def __init__(self, est=None, params=None, class_as_cluster=False, cl=None, classifier_params=None):
         self.est = est
@@ -315,128 +488,6 @@ class Regressor(BaseEstimator):
         return sum(regr.feature_importances_ for regr in self.regressors.itervalues()) / self.n_clusters
 
 
-class myPredictor(BaseEstimator):
-    def __init__(self, cluster=None, columns=None, dataTransformer=None,
-                 model_params=None, base_predictor="GBRT", bins=None, subsample=100000):
-        self.cluster = cluster
-        self.columns = columns
-        self.dataTransformer = dataTransformer
-        self.model_params = model_params
-        self.base_predictor = base_predictor
-        self.bins = bins
-        self.subsample = subsample
-
-    def fit(self, X, y):
-        self.model = {}
-        if self.bins is None:
-            self.bins = {0: None, 1: None}
-        labels = self.cluster["cluster"].transform(X)
-
-        for l in np.unique(labels):
-            lX, columns_ = self.dataTransformer[l].transform(X[labels == l])
-            ly = y[labels == l]
-
-            self.model[l] = Pipeline([("featureSelector", FeatureSelector()),
-                                      ("regressor", globals()[self.base_predictor]())
-                                      ])
-            self.model[l].set_params(**self.model_params[l])
-            self.model[l].set_params(**dict(regressor__verbose=1))
-            self.model[l].fit(lX, ly, regressor__subsample=self.subsample, regressor__bins=self.bins[l])
-
-        return self
-
-    def predict(self, X):
-        labels = self.cluster["cluster"].transform(X)
-        pred = np.zeros(shape=(X.shape[0],), dtype=float)
-        for l in np.unique(labels):
-            lX, columns_ = self.dataTransformer[l].transform(X[labels == l])
-            pred[labels == l] = self.model[l].predict(lX)
-        return pred
-
-    def predict_proba(self, X):
-        labels = self.cluster["cluster"].transform(X)
-        pred = {}
-        for l in np.unique(labels):
-            lX, columns_ = self.dataTransformer[l].transform(X[labels == l])
-            pred[l] = self.model[l].predict_proba(lX)
-        return pred
-
-    def labels(self, X):
-        return self.cluster["cluster"].transform(X)
-
-
-class GBRT(GradientBoostingRegressor):
-    def fit(self, X, y, monitor=None, subsample=50000, bins=None, **kwargs):
-        if subsample and (X.shape[0] > subsample):
-            size = min(X.shape[0], subsample)
-            ix = randomState.choice(np.arange(X.shape[0]), size=size, replace=False)
-            tmpX = X[ix, :]
-            tmpY = y[ix]
-            return super(GBRT, self).fit(tmpX, tmpY, monitor=monitor)
-        else:
-            return super(GBRT, self).fit(X, y, monitor=monitor)
-
-
-class GBCT(GradientBoostingClassifier):
-    def fit(self, X, y, monitor=None, subsample=50000, bins=None, **kwargs):
-        # print X.shape, self.get_params()
-        y = np.ceil(y).astype(np.int8)
-        y = np.vectorize(lambda x: bins[x])(y)
-        if subsample and (X.shape[0] > subsample):
-            # size = min(X.shape[0], subsample)
-            ix = randomState.choice(np.arange(X.shape[0]), size=subsample, replace=False)
-            tmpX = X[ix, :]
-            tmpY = y[ix]
-            return super(GBCT, self).fit(tmpX, tmpY, monitor=monitor)
-        else:
-            return super(GBCT, self).fit(X, y, monitor=monitor)
-
-
-class FeatureSelector(BaseEstimator, TransformerMixin):
-    def __init__(self, feature_importance=None, importance_threshold=None, column_names=None):
-        self.feature_importance = feature_importance
-        self.importance_threshold = importance_threshold
-        self.column_names = column_names
-        self.important_features = None
-        self.important_features_names = None
-
-    def fit(self, X, y=None, subsample=False, bins=None):
-        self.important_features = np.where(self.feature_importance > self.importance_threshold)[0]
-        self.important_features_names = self.column_names[self.important_features]
-        # print "important features {0}".format(self.important_features.size), self.feature_importance[self.important_features].sum(), self.feature_importance.sum()
-
-        return self
-
-    def transform(self, X):
-        return X[:, self.important_features]
-
-    @property
-    def important_columns_(self):
-        return self.important_features_names
-
-
-def findBestBiasAndScale(X, y, estimator, randomState):
-    best_scale, best_bias, best_score = 0., 0., -1.
-    ix = randomState.choice(np.arange(X.shape[0]), size=100000, replace=False)
-    tmpX, tmpY = X[ix, :], y[ix].copy()
-    tmpY[tmpY > 70.] = 70.
-
-    if X.shape[0] < 500000:
-        scale_range = np.arange(1.5, 1.7, 0.1)
-        bias_range = np.arange(2.1, 2.7, 0.1)
-    else:
-        scale_range = np.arange(3, 5, 0.5)
-        bias_range = np.arange(12., 17., 1.)
-
-    for scale in scale_range:
-        for bias in bias_range:
-            score = scorer(estimator, tmpX, tmpY, scale=scale, bias=bias)
-            print scale, bias, score
-            if score > best_score:
-                best_score, best_scale, best_bias = score, scale, bias
-    print best_scale, best_bias, best_score
-    return best_scale, best_bias, best_score
-
 if __name__ == "__main__":
     CLASSIF = False
 
@@ -480,7 +531,7 @@ if __name__ == "__main__":
         param_grid = dict(featureSelector__importance_threshold=[0.001, 0.01, 0.02, 0.03],
                           regressor__max_depth=[6 if big_cluster else 3])
         e.fit(X, y)
-        print "primary score {0}, time {1}".format(scorer_(e, X, y), timePassed(start))
+        print "primary score {0}, time {1}".format(scorer_(e, X, y), time_passed(start))
         prediction_model = Pipeline([("featureSelector", FeatureSelector(e.feature_importances_, 0.004, columns_)),
                                     ("regressor", globals()[my_predictor](min_samples_leaf=20, learning_rate=0.05, n_estimators=100, subsample=0.8, random_state=0))
                                      ])
@@ -498,7 +549,7 @@ if __name__ == "__main__":
 
         pred[labels == l] = gridSearch.best_estimator_.predict(X)
 
-        best_scale, best_bias, best_score = findBestBiasAndScale(X, y, gridSearch.best_estimator_, randomState)
+        best_scale, best_bias, best_score = find_best_bias_and_scale(X, y, gridSearch.best_estimator_, randomState)
 
         output["clust"][l] = {"dataTransformer": dataTransformer,
                               "model": gridSearch.best_estimator_,
@@ -511,8 +562,8 @@ if __name__ == "__main__":
     prob = np.ones((data.shape[0], 70), dtype=np.float32)
     best_par = {k: v["best_distr_par"] for k, v in output["clust"].iteritems()}
     for l in np.unique(labels):
-        prob[labels == l] = getProb(pred[labels == l], **best_par[l])
-    print "total score: ", calcCRPS(prob, target.reshape((target.size, 1)))
+        prob[labels == l] = get_prob_from_prediction(pred[labels == l], **best_par[l])
+    print "total score: ", calc_crps(prob, target.reshape((target.size, 1)))
     cPickle.dump(output, open("best_model.pkl", "w"))
 
     del X, y, prob, pred, importance, e, prediction_model, output, dataTransformer, columns_, clust, labels
@@ -521,7 +572,7 @@ if __name__ == "__main__":
     best_output = cPickle.load(open("best_model.pkl"))
 
     # MODEL VALIDATION
-    model = myPredictor(cluster={"cluster": best_output["clusterer"]}, columns=best_output["columns"],
+    model = MyPredictor(cluster={"cluster": best_output["clusterer"]}, columns=best_output["columns"],
                         dataTransformer={k: v["dataTransformer"] for k, v in best_output["clust"].iteritems()},
                         model_params={k: v["model"].get_params() for k, v in best_output["clust"].iteritems()},
                         base_predictor=my_predictor)
@@ -548,7 +599,7 @@ if __name__ == "__main__":
     prob = np.ones((test_data.shape[0], 70), dtype=np.float32)
 
     for l in np.unique(labels):
-        prob[labels == l] = getProb(pred[labels == l], bias=best_par[l]["bias"], scale=best_par[l]["scale"])
+        prob[labels == l] = get_prob_from_prediction(pred[labels == l], bias=best_par[l]["bias"], scale=best_par[l]["scale"])
 
     submission = pd.DataFrame(prob, columns=["Predicted"+str(i) for i in range(70)])
     submission["Id"] = Id.astype(int)
