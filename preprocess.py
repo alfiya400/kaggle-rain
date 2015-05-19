@@ -5,24 +5,8 @@ import numpy as np
 import time
 import cPickle
 from joblib import Parallel, delayed
-from charts.correlation_plots import correlation_plot
 
-NAN = np.array([-99900.0, np.nan, -99903.0, -99901.0, 999.0])
-
-
-def calcStat(seq):
-    # u'mean', u'std', u'min', u'50%', u'max'
-    not_null = (~pd.isnull(seq))
-    seq_not_null = seq[not_null]
-    if seq_not_null.size > 1:
-        stat = [seq_not_null.mean(), seq_not_null.std(ddof=1), seq_not_null.min(),
-                np.percentile(seq_not_null, 50), seq_not_null.max()]
-    elif seq_not_null.size == 1:
-        _ = seq_not_null[0]
-        stat = [_, 0, _, _, _]
-    else:
-        stat = [np.nan] * 5
-    return stat
+NAN = np.array([-99900.0, np.nan, -99903.0, -99901.0, 999.0])  # values corresponding to nan
 
 HYDROMETEOR_TYPE = {
     0: "no_echo",
@@ -41,68 +25,108 @@ HYDROMETEOR_TYPE = {
     13: "graupel",
     14: "graupel"}
 
-PRECIP = list(set(HYDROMETEOR_TYPE.values()))
+PRECIP = HYDROMETEOR_TYPE.values()
 
-STATS = [u'mean', u'std', u'min', u'50%', u'max']
+STATS = [u'mean', u'std', u'min', u'50%', u'max']  # aggregations
 
 
-def appendData(l, idx, h, columns, new_row, l_distance=None):
+def calc_aggregations(seq):
+    """
+    Used in "appendData" function
+    function calculates aggregations for @seq
+    Null values are ignored
+    :param seq: numpy.array
+    :return: list
+        List of aggregations
+    """
+    not_null = (~pd.isnull(seq))
+    seq_not_null = seq[not_null]
+    if seq_not_null.size > 1:
+        stat = [seq_not_null.mean(), seq_not_null.std(ddof=1), seq_not_null.min(),
+                np.percentile(seq_not_null, 50), seq_not_null.max()]
+    elif seq_not_null.size == 1:
+        _ = seq_not_null[0]
+        stat = [_, 0, _, _, _]
+    else:
+        stat = [np.nan] * 5
+    return stat
 
-    # if h not in ("DistanceToRadar", "TimeToEnd"):
-    #     min_distance_idx = np.where(l_distance == l_distance.min())[0]
-    #     l = l[min_distance_idx]
 
+def stats_per_feature(l, idx, h, columns, new_row):
+    """
+    Used in "transform" function
+    Calculates aggregations for @l
+
+    :param l: numpy.array
+    :param idx: numpy.array
+    :param h: str
+        feature name (e.g. DistanceToRadar, TimeToEnd, RR1 etc.)
+    :param columns: list
+        new features names (e.g. DistanceToRadar_min, DistanceToRadar_max etc.)
+    :param new_row: list
+        new features values
+    :return:
+    """
+
+    # For HydrometeorType calculate most frequent type and then transform it to a vector of all hydrometeor types
+    # In this vector:
+    #   values is 0 if type is not the most frequent type
+    #   value equals to a frequency if type is most frequent
     if h == "HydrometeorType":
 
-        p_map = {k: 0 for k in PRECIP}
+        p_map = {k: 0 for k in PRECIP}  # init vector of frequencies with 0
+
+        # calc frequencies
         for v in l:
             p_map[HYDROMETEOR_TYPE[v]] += 1
+        # most frequent type
         best = p_map.keys()[np.argmax(p_map.values())]
+
+        # create final vector
         for p in PRECIP:
             columns.append(p)
             if p == best:
                 new_row.append(p_map[p])
             else:
                 new_row.append(0)
-        # closest_distance_idx = idx[np.argmin(l_distance[idx])]
-        # HydrometeorType_closest = HYDROMETEOR_TYPE[l[closest_distance_idx]]
-        # for p in PRECIP:
-        #     columns.append(p+"_closest")
-        #     if p == HydrometeorType_closest:
-        #         new_row.append(1) #p_map[p]
-        #     else:
-        #         new_row.append(0)
 
     elif h == "DistanceToRadar":
-        values = l[idx]
+        values = l[idx]  # get only 1 value for each radar
         columns.extend([h + "_" + k for k in [u'min', u'50%', u'mean', u'max']])
         new_row.extend([values.min(), np.percentile(values, 50), values.mean(), values.max()])
     elif h == "TimeToEnd":
         columns.append("time")
-        new_row.append((l.max() - l.min() + 6.) / 60.)
+        new_row.append((l.max() - l.min() + 6.) / 60.)  # total time
         columns.append("n_obs")
-        new_row.append(l.size)
+        new_row.append(l.size)  # total number of observations
 
     elif h == "Kdp":
+        # calc KDP statistics with RR3
         pass
     elif h == "RR3":
-        stat = calcStat(l)
+        stat = calc_aggregations(l)
         columns.extend([h + "_" + k for k in STATS])
         new_row.extend(stat)
 
-        #calc KDP
-        kdp = np.sign(l) * np.exp(np.log(np.abs(l)/40.6)/0.866)
-        stat = calcStat(kdp)
+        # calc KDP
+        kdp = np.sign(l) * np.exp(np.log(np.abs(l) / 40.6) / 0.866)  # got this formula from forum
+        stat = calc_aggregations(kdp)
         columns.extend(["Kdp" + "_" + k for k in STATS])
         new_row.extend(stat)
 
     else:
-        stat = calcStat(l)
+        stat = calc_aggregations(l)
         columns.extend([h + "_" + k for k in STATS])
         new_row.extend(stat)
 
 
-def getValues(s):
+def get_values(s):
+    """
+    Used in "transform function"
+    Extracts numeric values from string and replaces values specified in NAN to np.nan
+    :param s: str
+    :return: numpy.array
+    """
     l = np.array(s.split(" "), dtype=float)
     nan = np.in1d(l, NAN)
     l[nan] = np.nan
@@ -110,30 +134,50 @@ def getValues(s):
 
 
 def transform(row, test=False):
-    # row - Series
+    """
+    Used in "preprocess" function
+    This function extracts features from the @row.
+    For each observation from radars it calculated aggregations
+
+    :param row: pandas.Series
+        Contains list of observations from radars over 1 hour
+    :param test:
+        test file indicator
+        if True, then supposed that there is no "Expected" feature
+    :return:
+    """
+    # Extract Id
     new_row = [row["Id"]]
     columns = ["Id"]
-    # get radars
-    l_timeToEnd = getValues(row["TimeToEnd"])
+
+    # Get staring indexes for each radar
+    # New radar detected if "TimeToEnd" value increased or
+    # if "DistanceToRadar" value changed (as far as radars can't move)
+    l_timeToEnd = get_values(row["TimeToEnd"])
+
+    # Indicator of increase in value TimeToEnd
     idx_timeToEnd = np.insert(np.where(np.diff(l_timeToEnd) > 0)[0], 0, 0)
 
-    l_distance = getValues(row["DistanceToRadar"])
+    l_distance = get_values(row["DistanceToRadar"])
+    # indicator of change in value DistanceToRadar
     idx = np.insert(np.where(np.diff(l_distance) != 0)[0], 0, 0)
 
+    # final list of starting indices for radars
     idx_ = np.unique(np.concatenate([idx, idx_timeToEnd])) if idx.size > 1 else idx_timeToEnd
 
-    # append
-    appendData(l_timeToEnd, idx_, "TimeToEnd", columns, new_row)
-    appendData(l_distance, idx_, "DistanceToRadar", columns, new_row)
+    # calc statistics for timeToEnd and DistanceToRadar
+    stats_per_feature(l_timeToEnd, idx_, "TimeToEnd", columns, new_row)
+    stats_per_feature(l_distance, idx_, "DistanceToRadar", columns, new_row)
 
     if test:
         drop_cols = ["Id", "TimeToEnd", "DistanceToRadar"]
     else:
         drop_cols = ["Id", "Expected", "TimeToEnd", "DistanceToRadar"]
 
+    # calc statistics for any other features
     for h, v in row.drop(drop_cols).iteritems():
-        l = getValues(v)
-        appendData(l, idx_, h, columns, new_row, l_distance)
+        l = get_values(v)
+        stats_per_feature(l, idx_, h, columns, new_row)
 
     if test:
         columns.append("nRadars")
@@ -145,110 +189,75 @@ def transform(row, test=False):
 
 
 def foo(x, transform, axis=1, test=False):
-        return x.apply(transform, axis=axis, args=(test,))
+    """
+    Supporting function, used only in "preprocess" function
+    :param x:
+    :param transform:
+    :param axis:
+    :param test:
+    :return:
+    """
+    return x.apply(transform, axis=axis, args=(test,))
 
 
-def preprocess(file_in, file_out, test=False):
+def preprocess(file_in, file_out, test=False, n_jobs=6):
+    """
+    This function preprocesses raw data file.
+    For each row and for each feature it extracts aggregations over TimeToEnd:
+        From feature TimeToEnd it extracts total time ("time") and number of observations ("n_obs")
+        From feature DistanceToRadar it extracts aggregations ('min', '50% quantile', 'mean', 'max')
+        For any other features it calculates ('mean', 'std', 'min', '50% quantile', 'max')
 
+        New features names follow the pattern: <feature name>_<aggregation function>
+
+    Parameters
+    ----------
+    :param file_in: str
+        csv-file name for data to be preprocessed
+    :param file_out: str
+        csv-file name for output data
+    :param test: bool
+        indicator for test data (data without label)
+    :return:
+    """
+    # Load data to pandas.DataFrame
     data_raw = pd.read_csv(file_in, na_filter=False, chunksize=5000)
+
+    # Apply transformations to data chunks in parallel
     start = time.time()
-    # foo(data_raw.get_chunk(10), transform, axis=1)
-    data = Parallel(n_jobs=6, verbose=11)(delayed(foo)(x, transform, axis=1, test=test) for i, x in enumerate(data_raw))
-    print round((time.time() - start)/60, 3)
-    print len(data)
-    start = time.time()
+    data = Parallel(n_jobs=n_jobs, verbose=11)(delayed(foo)(x, transform, axis=1, test=test) for i, x in enumerate(data_raw))
+    print "Preprocessing time: ", round((time.time() - start) / 60, 3)
+    print "Records: ", len(data)
+
+    # Join data chunks and save result to csv
     data = pd.concat(data)
     data.to_csv(file_out, index=False)
-    print round((time.time() - start)/60, 3)
 
     print "File", file_in, "preprocessed to", file_out
 
 
 def corr_matrix(file_in, corr_file):
+    """
+    This function loads data from @file_in to pandas.DataFrame,
+    calculates Pearson correlations between features and dumps result into @corr_file using cPickle
+
+    :param file_in: str
+        csv-file name to data
+    :param corr_file: str
+        filename for correlation matrix
+    :return:
+    """
     data = pd.read_csv(file_in)
     data.drop("Id", axis=1, inplace=True)
 
     corr = data.corr()
     with open(corr_file, "w") as f:
         cPickle.dump(corr, f)
-    correlation_plot(corr, "plots/correlations.html")
-
-
-def csv2libFM_row(x, y_name="Expected"):
-
-    data_iter = ((str(i + 1), v) for i, v in enumerate(x.values if y_name is None else x.drop(y_name).values) if v)  # skip NA values
-    y = min(70, float("0." if y_name is None else x[y_name]))
-
-    return "{y} {data}".format(y=str(y),
-                               data=" ".join([":".join(_) for _ in data_iter]))
-
-
-def libfm_foo(x, transform, drop_cols, axis=1, y_name=None):
-    x.drop(drop_cols, axis=1, inplace=True)
-    return x.apply(transform, axis=axis, args=(y_name,))
-
-
-def csv2libFM(filename, y_name=None, drop_cols=None):
-    if drop_cols is None:
-        drop_cols = ["Id"]
-    data_raw = pd.read_csv(filename, na_filter=False, dtype=str, chunksize=10000)
-    # data_raw.drop(drop_cols, axis=1, inplace=True)
-
-    start = time.time()
-    data = Parallel(n_jobs=4, verbose=11)(delayed(libfm_foo)(x, csv2libFM_row, y_name=y_name, drop_cols=drop_cols) for x in data_raw)
-    data = pd.concat(data)
-
-    file_out = ".".join([filename.split(".")[0], "libfm"])
-    data.to_csv(file_out, index=False)
-
-    t = round((time.time() - start) / 60, 3)
-
-    print "File {filename} preprocessed to {file_out}, time {time}".format(filename=filename, file_out=file_out, time=t)
-
-
-def meta_file(filename, drop_cols=None):
-    if drop_cols is None:
-        drop_cols = ["Expected", "Id"]
-    data_raw = pd.read_csv(filename, dtype=float)
-    data_raw.drop(drop_cols, axis=1, inplace=True)
-
-    null_rate = np.round(pd.isnull(data_raw).sum() / float(data_raw.shape[0]), 5)
-    uni = null_rate.unique()
-
-    zero_iter = uni.size - 1
-    zero_map = dict()
-    for _ in null_rate[null_rate == 0].index.values:
-        k = "PRECIP" if _ in PRECIP else _.split("_")[0]
-
-        if k not in zero_map:
-            zero_map[k] = [_]
-        else:
-            zero_map[k].append(_)
-
-    inverted_zero_map = dict()
-    for v in zero_map.itervalues():
-        for v_ in v:
-            inverted_zero_map[v_] = zero_iter
-        zero_iter += 1
-
-    groups = []
-    for _ in data_raw.columns.values:
-        if null_rate[_]:
-            groups.append(str(np.where(uni == null_rate[_])[0][0] - 1) + "\n")
-        else:
-            groups.append(str(inverted_zero_map[_]) + "\n")
-
-    with open("data/libfmdata.meta", "w") as f:
-        f.writelines(groups)
 
 
 if __name__ == "__main__":
 
-    # preprocess("data/train_2013.csv", "data/train_preprocessed.csv")
-    # preprocess("data/test_2014.csv", "data/test_preprocessed.csv", test=True)
-    #
-    # corr_matrix("data/train_preprocessed.csv", "data/corr_matrix.pkl")
+    preprocess("data/train_2013.csv", "data/train_preprocessed.csv", n_jobs=6)
+    preprocess("data/test_2014.csv", "data/test_preprocessed.csv", test=True, n_jobs=6)
 
-    csv2libFM("data/train_preprocessed.csv", y_name="Expected")
-    csv2libFM("data/test_preprocessed.csv", y_name=None)
-    meta_file("data/train_preprocessed.csv", drop_cols=None)
+    corr_matrix("data/train_preprocessed.csv", "data/corr_matrix.pkl")
